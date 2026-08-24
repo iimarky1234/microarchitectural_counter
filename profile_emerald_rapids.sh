@@ -37,6 +37,7 @@ RUNS=10
 WARMUP=3
 OUT_DIR=""
 USE_HYPERFINE=true
+HYPERFINE_ONLY=false
 VERBOSE=false
 
 # --- ANSI Color Codes ---
@@ -60,6 +61,7 @@ usage() {
   echo "  -w, --warmup <NUM>      Warmup iterations before benchmarking (Default: 3)"
   echo "  -o, --out-dir <DIR>     Output directory for markdown/csv reports (Default: ./result)"
   echo "      --no-hyperfine      Disable hyperfine benchmarking even if installed"
+  echo "      --hyperfine-only    Run only hyperfine wall-clock benchmark (skip PMU profiling)"
   echo "  -v, --verbose           Print verbose debugging output"
   echo "  -h, --help              Show this help message and exit"
   echo ""
@@ -67,6 +69,7 @@ usage() {
   echo "  $(basename "$0") ./bin/silent/matrix_multiply"
   echo "  $(basename "$0") -c 0 -r 20 -w 5 ./bin/silent/sha256"
   echo "  $(basename "$0") --no-pin -r 20 ./bin/silent/sha256"
+  echo "  $(basename "$0") --hyperfine-only -r 50 ./bin/silent/sha256"
   echo "  $(basename "$0") -c 0 -o ./result -- ./bin/silent/array_sort"
   exit 0
 }
@@ -104,6 +107,11 @@ while [[ $# -gt 0 ]]; do
     USE_HYPERFINE=false
     shift 1
     ;;
+  --hyperfine-only | --only-hyperfine)
+    HYPERFINE_ONLY=true
+    USE_HYPERFINE=true
+    shift 1
+    ;;
   -v | --verbose)
     VERBOSE=true
     shift 1
@@ -129,11 +137,21 @@ if [[ ${#POSITIONAL_ARGS[@]} -eq 0 ]]; then
   exit 1
 fi
 
+if [[ "$HYPERFINE_ONLY" == "true" && "$USE_HYPERFINE" == "false" ]]; then
+  echo -e "${RED}Error: Conflicting options --hyperfine-only and --no-hyperfine specified.${NC}"
+  exit 1
+fi
+
 TARGET_CMD="${POSITIONAL_ARGS[*]}"
 TARGET_BIN="${POSITIONAL_ARGS[0]}"
 
 # --- Dependency Verification ---
-REQUIRED_CMDS=("perf" "awk" "bc")
+REQUIRED_CMDS=("awk" "bc")
+if [[ "$HYPERFINE_ONLY" == "true" ]]; then
+  REQUIRED_CMDS+=("hyperfine")
+else
+  REQUIRED_CMDS+=("perf")
+fi
 if [[ "$USE_TASKSET" == "true" ]]; then
   REQUIRED_CMDS+=("taskset")
 fi
@@ -219,7 +237,11 @@ fi
 
 # --- Banner Display ---
 echo -e "${CYAN}======================================================================${NC}"
-echo -e "${BOLD}         INTEL EMERALD RAPIDS HARDWARE PROFILER                       ${NC}"
+if [[ "$HYPERFINE_ONLY" == "true" ]]; then
+  echo -e "${BOLD}         INTEL EMERALD RAPIDS BENCHMARK (HYPERFINE ONLY)              ${NC}"
+else
+  echo -e "${BOLD}         INTEL EMERALD RAPIDS HARDWARE PROFILER                       ${NC}"
+fi
 echo -e "${CYAN}======================================================================${NC}"
 echo -e " ${BOLD}Target Command:${NC}   $TARGET_CMD"
 echo -e " ${BOLD}Architecture:${NC}     $ARCH"
@@ -228,14 +250,97 @@ echo -e " ${BOLD}Core Pinning:${NC}     $PINNING_INFO"
 echo -e " ${BOLD}Cache Line Size:${NC}  $CACHE_LINE_SIZE Bytes"
 echo -e " ${BOLD}CPU Frequency:${NC}    $CPU_FREQ_MHZ MHz"
 echo -e " ${BOLD}Repetitions:${NC}      $RUNS (Warmup: $WARMUP)"
-echo -e " ${BOLD}PMU Events:${NC}       CPU_CLK_UNHALTED.THREAD (0x3c,0x00), INST_RETIRED.ANY (0xc0,0x00),"
-echo -e "                     BR_INST_RETIRED.ALL_BRANCHES (0xc4,0x00),"
-echo -e "                     BR_MISP_RETIRED.ALL_BRANCHES (0xc5,0x00),"
-echo -e "                     MEM_LOAD_RETIRED.L1_MISS (0xd1,0x08),"
-echo -e "                     MEM_INST_RETIRED.ALL_LOADS (0xd0,0x81),"
-echo -e "                     L2_LINES_IN.ALL (0x25,0x1f),"
-echo -e "                     L2_LINES_OUT.NON_SILENT (0x26,0x02)"
+if [[ "$HYPERFINE_ONLY" != "true" ]]; then
+  echo -e " ${BOLD}PMU Events:${NC}       CPU_CLK_UNHALTED.THREAD (0x3c,0x00), INST_RETIRED.ANY (0xc0,0x00),"
+  echo -e "                     BR_INST_RETIRED.ALL_BRANCHES (0xc4,0x00),"
+  echo -e "                     BR_MISP_RETIRED.ALL_BRANCHES (0xc5,0x00),"
+  echo -e "                     MEM_LOAD_RETIRED.L1_MISS (0xd1,0x08),"
+  echo -e "                     MEM_INST_RETIRED.ALL_LOADS (0xd0,0x81),"
+  echo -e "                     L2_LINES_IN.ALL (0x25,0x1f),"
+  echo -e "                     L2_LINES_OUT.NON_SILENT (0x26,0x02)"
+fi
 echo -e "${CYAN}----------------------------------------------------------------------${NC}"
+
+# --- Hyperfine Only Execution Branch ---
+if [[ "$HYPERFINE_ONLY" == "true" ]]; then
+  echo -e "${BLUE}[1/1] Running high-precision wall-clock benchmarking via hyperfine...${NC}"
+  HF_CMD="$TARGET_CMD"
+  [[ "$USE_TASKSET" == "true" ]] && HF_CMD="taskset -c $CPU_CORE $TARGET_CMD"
+  HF_OUTPUT=$(hyperfine --warmup "$WARMUP" --runs "$RUNS" --export-json "$REPORT_HF_JSON" "$HF_CMD" 2>&1)
+  echo "$HF_OUTPUT"
+
+  HF_MEAN_LINE=$(echo "$HF_OUTPUT" | grep "Time (mean ± σ):" | head -n1)
+  HYPERFINE_MEAN="N/A"
+  if [[ -n "$HF_MEAN_LINE" ]]; then
+    HYPERFINE_MEAN=$(echo "$HF_MEAN_LINE" | sed -e 's/.*Time (mean ± σ):[ \t]*//' -e 's/\[User:.*//' | sed -e 's/[ \t]*$//')
+  fi
+  HF_RANGE_LINE=$(echo "$HF_OUTPUT" | grep "Range (min … max):" | head -n1)
+  HYPERFINE_MIN="N/A"
+  HYPERFINE_MAX="N/A"
+  if [[ -n "$HF_RANGE_LINE" ]]; then
+    HYPERFINE_RANGE=$(echo "$HF_RANGE_LINE" | sed -e 's/.*Range (min … max):[ \t]*//' -e 's/[0-9][0-9]* runs.*//' | sed -e 's/[ \t]*$//')
+    HYPERFINE_MIN=$(echo "$HYPERFINE_RANGE" | awk -F '…' '{print $1}' | sed -e 's/[ \t]*$//')
+    HYPERFINE_MAX=$(echo "$HYPERFINE_RANGE" | awk -F '…' '{print $2}' | sed -e 's/^[ \t]*//')
+  fi
+
+  # Terminal Output Dashboard
+  echo -e "\n${CYAN}======================================================================${NC}"
+  echo -e "${BOLD}                     HYPERFINE BENCHMARK RESULTS                      ${NC}"
+  echo -e "${CYAN}======================================================================${NC}"
+  printf " ${BOLD}%-34s${NC} : ${BLUE}%s${NC}\n" "Wall-Clock Time (mean ± σ)" "$HYPERFINE_MEAN"
+  if [[ "$HYPERFINE_MIN" != "N/A" && "$HYPERFINE_MAX" != "N/A" ]]; then
+    printf " ${BOLD}%-34s${NC} : %s … %s\n" "Range (min … max)" "$HYPERFINE_MIN" "$HYPERFINE_MAX"
+  fi
+  printf " ${BOLD}%-34s${NC} : %s (Warmup: %s)\n" "Repetitions" "$RUNS" "$WARMUP"
+  echo -e "${CYAN}======================================================================${NC}"
+
+  # Export Markdown Report
+  cat <<EOF >"$REPORT_MD"
+# Intel Emerald Rapids Benchmark Report: \`$BIN_NAME\` (Hyperfine)
+
+- **Target Command:** \`$TARGET_CMD\`
+- **Date & Time:** $(date "+%Y-%m-%d %H:%M:%S %Z")
+- **Architecture:** \`$ARCH\` (Intel Emerald Rapids)
+- **CPU Model:** $CPU_MODEL
+- **Core Pinning:** $PINNING_MD
+- **Cache Line Size:** $CACHE_LINE_SIZE Bytes
+- **Runs / Warmup:** $RUNS runs (Warmup: $WARMUP)
+
+---
+
+## Hyperfine Wall-Clock Benchmark Results
+
+| Metric | Value | Description |
+| :--- | :--- | :--- |
+| **Wall-Clock Time (mean ± σ)** | **$HYPERFINE_MEAN** | Measured via hyperfine |
+$([ "$HYPERFINE_MIN" != "N/A" ] && echo "| **Min … Max Range** | $HYPERFINE_MIN … $HYPERFINE_MAX | Execution time bounds |")
+| **Repetitions** | $RUNS runs (Warmup: $WARMUP) | Measurement samples |
+EOF
+
+  # Export CSV Report
+  cat <<EOF >"$REPORT_CSV"
+Metric,Value,Unit
+Command,"$TARGET_CMD",command
+Architecture,"$ARCH",arch
+CPU_Model,"$CPU_MODEL",cpu
+Core_Pinned,$PINNING_CSV,core
+Cache_Line_Size,$CACHE_LINE_SIZE,bytes
+Runs,$RUNS,count
+Warmup,$WARMUP,count
+Hyperfine_Mean,"$HYPERFINE_MEAN",time_str
+Hyperfine_Min,"$HYPERFINE_MIN",time_str
+Hyperfine_Max,"$HYPERFINE_MAX",time_str
+EOF
+
+  echo -e "${GREEN}✔ Reports successfully generated:${NC}"
+  echo -e "  • Markdown Report : ${REPORT_MD}"
+  echo -e "  • CSV Data Report : ${REPORT_CSV}"
+  if [[ -f "$REPORT_HF_JSON" ]]; then
+    echo -e "  • Hyperfine JSON  : ${REPORT_HF_JSON}"
+  fi
+  echo ""
+  exit 0
+fi
 
 # --- Warmup Execution ---
 if [[ "$WARMUP" -gt 0 ]]; then
@@ -305,14 +410,23 @@ L2_TOTAL_THROUGHPUT_MBS=$(awk -v in_l="$L2_LINES_IN_ALL" -v out_l="$L2_LINES_OUT
 
 # --- Step 4: Hyperfine Benchmarking ---
 HYPERFINE_MEAN="N/A"
+HYPERFINE_RANGE="N/A"
+HYPERFINE_MIN="N/A"
+HYPERFINE_MAX="N/A"
 if [[ "$USE_HYPERFINE" == "true" ]] && command -v hyperfine &>/dev/null; then
   echo -e "${BLUE}[3/3] Running high-precision wall-clock benchmarking via hyperfine...${NC}"
   HF_CMD="$TARGET_CMD"
   [[ "$USE_TASKSET" == "true" ]] && HF_CMD="taskset -c $CPU_CORE $TARGET_CMD"
   HF_OUTPUT=$(hyperfine --warmup "$WARMUP" --runs "$RUNS" --export-json "$REPORT_HF_JSON" "$HF_CMD" 2>&1)
-  HF_LINE=$(echo "$HF_OUTPUT" | grep "Time (mean ± σ):" | head -n1)
-  if [[ -n "$HF_LINE" ]]; then
-    HYPERFINE_MEAN=$(echo "$HF_LINE" | sed -e 's/.*Time (mean ± σ):[ \t]*//' | awk '{print $1, $2, $3, $4}')
+  HF_MEAN_LINE=$(echo "$HF_OUTPUT" | grep "Time (mean ± σ):" | head -n1)
+  if [[ -n "$HF_MEAN_LINE" ]]; then
+    HYPERFINE_MEAN=$(echo "$HF_MEAN_LINE" | sed -e 's/.*Time (mean ± σ):[ \t]*//' -e 's/\[User:.*//' | sed -e 's/[ \t]*$//')
+  fi
+  HF_RANGE_LINE=$(echo "$HF_OUTPUT" | grep "Range (min … max):" | head -n1)
+  if [[ -n "$HF_RANGE_LINE" ]]; then
+    HYPERFINE_RANGE=$(echo "$HF_RANGE_LINE" | sed -e 's/.*Range (min … max):[ \t]*//' -e 's/[0-9][0-9]* runs.*//' | sed -e 's/[ \t]*$//')
+    HYPERFINE_MIN=$(echo "$HYPERFINE_RANGE" | awk -F '…' '{print $1}' | sed -e 's/[ \t]*$//')
+    HYPERFINE_MAX=$(echo "$HYPERFINE_RANGE" | awk -F '…' '{print $2}' | sed -e 's/^[ \t]*//')
   fi
 else
   echo -e "${BLUE}[3/3] Hyperfine skipped (using perf elapsed time: ${ELAPSED_SEC} s).${NC}"
