@@ -31,6 +31,7 @@ set -u
 
 # --- Default Configurations ---
 CPU_CORE=0
+USE_TASKSET=true
 RUNS=10
 WARMUP=3
 OUT_DIR=""
@@ -53,6 +54,7 @@ usage() {
   echo ""
   echo -e "${BOLD}Options:${NC}"
   echo "  -c, --core <NUM>        CPU core to pin execution with taskset (Default: 0)"
+  echo "      --no-pin            Disable CPU core pinning (taskset)"
   echo "  -r, --runs <NUM>        Number of repetitions for measurement (Default: 10)"
   echo "  -w, --warmup <NUM>      Warmup iterations before benchmarking (Default: 3)"
   echo "  -o, --out-dir <DIR>     Output directory for markdown/csv reports (Default: ./result)"
@@ -63,6 +65,7 @@ usage() {
   echo -e "${BOLD}Examples:${NC}"
   echo "  $(basename "$0") ./bin/silent/matrix_multiply"
   echo "  $(basename "$0") -c 0 -r 20 -w 5 ./bin/silent/sha256"
+  echo "  $(basename "$0") --no-pin -r 20 ./bin/silent/sha256"
   echo "  $(basename "$0") -c 0 -o ./result -- ./bin/silent/array_sort"
   exit 0
 }
@@ -72,8 +75,17 @@ POSITIONAL_ARGS=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
   -c | --core)
-    CPU_CORE="$2"
+    if [[ "$2" == "none" || "$2" == "off" || "$2" == "-1" || "$2" == "false" ]]; then
+      USE_TASKSET=false
+    else
+      CPU_CORE="$2"
+      USE_TASKSET=true
+    fi
     shift 2
+    ;;
+  --no-pin | --no-taskset | --disable-taskset)
+    USE_TASKSET=false
+    shift 1
     ;;
   -r | --runs)
     RUNS="$2"
@@ -120,7 +132,11 @@ TARGET_CMD="${POSITIONAL_ARGS[*]}"
 TARGET_BIN="${POSITIONAL_ARGS[0]}"
 
 # --- Dependency Verification ---
-for cmd in perf taskset awk bc; do
+REQUIRED_CMDS=("perf" "awk" "bc")
+if [[ "$USE_TASKSET" == "true" ]]; then
+  REQUIRED_CMDS+=("taskset")
+fi
+for cmd in "${REQUIRED_CMDS[@]}"; do
   if ! command -v "$cmd" &>/dev/null; then
     echo -e "${RED}Error: Required command '$cmd' is not installed or not in PATH.${NC}"
     exit 1
@@ -133,7 +149,11 @@ CPU_MODEL=$(lscpu 2>/dev/null | grep -E "Model name|CPU part" | head -n1 | sed -
 [[ -z "$CPU_MODEL" ]] && CPU_MODEL="ARM Neoverse-V2 ($ARCH)"
 
 # Cache line size (64 Bytes on Neoverse-V2)
-CACHE_LINE_SIZE_FILE="/sys/devices/system/cpu/cpu${CPU_CORE}/cache/index0/coherency_line_size"
+if [[ "$USE_TASKSET" == "true" ]]; then
+  CACHE_LINE_SIZE_FILE="/sys/devices/system/cpu/cpu${CPU_CORE}/cache/index0/coherency_line_size"
+else
+  CACHE_LINE_SIZE_FILE="/sys/devices/system/cpu/cpu0/cache/index0/coherency_line_size"
+fi
 if [[ -f "$CACHE_LINE_SIZE_FILE" ]]; then
   CACHE_LINE_SIZE=$(cat "$CACHE_LINE_SIZE_FILE" 2>/dev/null || echo 64)
 else
@@ -142,8 +162,10 @@ fi
 
 # CPU frequency
 CPU_FREQ_MHZ=$(lscpu 2>/dev/null | grep "CPU MHz" | head -n1 | sed -e 's/^[^:]*:[ \t]*//')
-if [[ -z "$CPU_FREQ_MHZ" && -f "/sys/devices/system/cpu/cpu${CPU_CORE}/cpufreq/scaling_cur_freq" ]]; then
-  CUR_FREQ_KHZ=$(cat "/sys/devices/system/cpu/cpu${CPU_CORE}/cpufreq/scaling_cur_freq" 2>/dev/null || echo 0)
+CPU_FREQ_FILE="/sys/devices/system/cpu/cpu${CPU_CORE}/cpufreq/scaling_cur_freq"
+[[ "$USE_TASKSET" != "true" ]] && CPU_FREQ_FILE="/sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq"
+if [[ -z "$CPU_FREQ_MHZ" && -f "$CPU_FREQ_FILE" ]]; then
+  CUR_FREQ_KHZ=$(cat "$CPU_FREQ_FILE" 2>/dev/null || echo 0)
   CPU_FREQ_MHZ=$(echo "scale=2; $CUR_FREQ_KHZ / 1000" | bc 2>/dev/null || echo "N/A")
 fi
 [[ -z "$CPU_FREQ_MHZ" ]] && CPU_FREQ_MHZ="N/A"
@@ -181,6 +203,19 @@ if [[ $EUID -ne 0 ]]; then
   fi
 fi
 
+# Taskset execution prefix
+TASKSET_PREFIX=""
+if [[ "$USE_TASKSET" == "true" ]]; then
+  TASKSET_PREFIX="taskset -c $CPU_CORE"
+  PINNING_INFO="Core $CPU_CORE (taskset -c $CPU_CORE)"
+  PINNING_MD="Core $CPU_CORE (\`taskset -c $CPU_CORE\`)"
+  PINNING_CSV="$CPU_CORE"
+else
+  PINNING_INFO="Disabled"
+  PINNING_MD="Disabled (No core pinning)"
+  PINNING_CSV="None"
+fi
+
 # --- Banner Display ---
 echo -e "${CYAN}======================================================================${NC}"
 echo -e "${BOLD}         ARM NEOVERSE-V2 HARDWARE PROFILER                            ${NC}"
@@ -188,7 +223,7 @@ echo -e "${CYAN}================================================================
 echo -e " ${BOLD}Target Command:${NC}   $TARGET_CMD"
 echo -e " ${BOLD}Architecture:${NC}     $ARCH"
 echo -e " ${BOLD}CPU Model:${NC}        $CPU_MODEL"
-echo -e " ${BOLD}Core Pinning:${NC}     Core $CPU_CORE (taskset -c $CPU_CORE)"
+echo -e " ${BOLD}Core Pinning:${NC}     $PINNING_INFO"
 echo -e " ${BOLD}Cache Line Size:${NC}  $CACHE_LINE_SIZE Bytes"
 echo -e " ${BOLD}CPU Frequency:${NC}    $CPU_FREQ_MHZ MHz"
 echo -e " ${BOLD}Repetitions:${NC}      $RUNS (Warmup: $WARMUP)"
@@ -202,15 +237,15 @@ echo -e "${CYAN}----------------------------------------------------------------
 if [[ "$WARMUP" -gt 0 ]]; then
   echo -e "${YELLOW}[1/3] Running $WARMUP warmup iteration(s)...${NC}"
   for ((i = 1; i <= WARMUP; i++)); do
-    taskset -c "$CPU_CORE" $TARGET_CMD >/dev/null 2>&1 || true
+    $TASKSET_PREFIX $TARGET_CMD >/dev/null 2>&1 || true
   done
 fi
 
 # --- Step 1: Collect Hardware Counters via perf stat ---
 echo -e "${GREEN}[2/3] Collecting ARM Neoverse-V2 PMU counters over $RUNS run(s)...${NC}"
-$PERF_PREFIX perf stat -x, -r "$RUNS" -e "$NEOVERSE_V2_EVENTS" taskset -c "$CPU_CORE" $TARGET_CMD >/dev/null 2>"$PERF_RAW_CSV" || {
+$PERF_PREFIX perf stat -x, -r "$RUNS" -e "$NEOVERSE_V2_EVENTS" $TASKSET_PREFIX $TARGET_CMD >/dev/null 2>"$PERF_RAW_CSV" || {
   echo -e "${YELLOW}Notice: Retrying with raw hex event codes...${NC}"
-  $PERF_PREFIX perf stat -x, -r "$RUNS" -e "r8,r11,r21,r22,r4,r3,r17,r18,duration_time" taskset -c "$CPU_CORE" $TARGET_CMD >/dev/null 2>"$PERF_RAW_CSV" || true
+  $PERF_PREFIX perf stat -x, -r "$RUNS" -e "r8,r11,r21,r22,r4,r3,r17,r18,duration_time" $TASKSET_PREFIX $TARGET_CMD >/dev/null 2>"$PERF_RAW_CSV" || true
 }
 
 # --- Step 2: Parse PMU Values ---
@@ -265,7 +300,9 @@ MIPS=$(awk -v inst="$INST_RETIRED" -v sec="$ELAPSED_SEC" 'BEGIN { if (sec > 0) p
 HYPERFINE_MEAN="N/A"
 if [[ "$USE_HYPERFINE" == "true" ]] && command -v hyperfine &>/dev/null; then
   echo -e "${BLUE}[3/3] Running high-precision wall-clock benchmarking via hyperfine...${NC}"
-  HF_OUTPUT=$(hyperfine --warmup "$WARMUP" --runs "$RUNS" --export-json "$REPORT_HF_JSON" "taskset -c $CPU_CORE $TARGET_CMD" 2>&1)
+  HF_CMD="$TARGET_CMD"
+  [[ "$USE_TASKSET" == "true" ]] && HF_CMD="taskset -c $CPU_CORE $TARGET_CMD"
+  HF_OUTPUT=$(hyperfine --warmup "$WARMUP" --runs "$RUNS" --export-json "$REPORT_HF_JSON" "$HF_CMD" 2>&1)
   HF_LINE=$(echo "$HF_OUTPUT" | grep "Time (mean ± σ):" | head -n1)
   if [[ -n "$HF_LINE" ]]; then
     HYPERFINE_MEAN=$(echo "$HF_LINE" | sed -e 's/.*Time (mean ± σ):[ \t]*//' | awk '{print $1, $2, $3, $4}')
@@ -321,7 +358,7 @@ cat <<EOF >"$REPORT_MD"
 - **Date & Time:** $(date "+%Y-%m-%d %H:%M:%S %Z")
 - **Architecture:** \`$ARCH\` (ARM Neoverse-V2)
 - **CPU Model:** $CPU_MODEL
-- **Core Pinning:** Core $CPU_CORE (\`taskset -c $CPU_CORE\`)
+- **Core Pinning:** $PINNING_MD
 - **Cache Line Size:** $CACHE_LINE_SIZE Bytes
 - **Runs / Warmup:** $RUNS runs (Warmup: $WARMUP)
 
@@ -360,7 +397,7 @@ Metric,Value,Unit
 Command,"$TARGET_CMD",command
 Architecture,"$ARCH",arch
 CPU_Model,"$CPU_MODEL",cpu
-Core_Pinned,$CPU_CORE,core
+Core_Pinned,$PINNING_CSV,core
 Cache_Line_Size,$CACHE_LINE_SIZE,bytes
 Runs,$RUNS,count
 Warmup,$WARMUP,count
